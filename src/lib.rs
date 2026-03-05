@@ -1,111 +1,27 @@
-use std::{
-    any::{Any, TypeId},
-    collections::BTreeMap,
-    ops::{Range, RangeBounds, RangeInclusive},
-    vec,
-};
+use std::{collections::BTreeMap, vec};
 
-pub trait ValueGenerator {
-    fn nth(&self, i: usize) -> Option<u64>;
-    fn max(&self) -> usize;
-}
-
-pub trait Encodable {
-    fn encode(self) -> u64;
-    fn decode(v: u64) -> Self;
-}
-
-trait Rangeable: Copy + Ord + Encodable {
-    fn add_n(self, n: usize) -> Option<Self>;
-}
-
-struct RangeGenerator<T> {
-    first: T,
-    total_len: usize,
-}
-
-impl<T> ValueGenerator for RangeGenerator<T>
-where
-    T: Rangeable,
-{
-    fn nth(&self, i: usize) -> Option<u64> {
-        self.first.add_n(i).map(Encodable::encode)
-    }
-
-    fn max(&self) -> usize {
-        self.total_len
-    }
-}
-
-struct ValueGeneratorVTable {
-    nth: unsafe fn(*const (), i: usize) -> Option<u64>,
-    max: unsafe fn(*const ()) -> usize,
-    drop: unsafe fn(*mut ()),
-}
-
-struct DynValueGenerator {
-    generator: *mut (),
-    vtable: ValueGeneratorVTable,
-}
-
-impl Drop for DynValueGenerator {
-    fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(self.generator) }
-    }
-}
-
-impl DynValueGenerator {
-    fn new<V: ValueGenerator>(v: V) -> Self {
-        let generator = Box::new(v);
-        let generator_ptr = Box::into_raw(generator);
-        unsafe fn nth<V: ValueGenerator>(generator: *const (), i: usize) -> Option<u64> {
-            V::nth(unsafe { &*generator.cast() }, i)
-        }
-        unsafe fn max<V: ValueGenerator>(generator: *const ()) -> usize {
-            V::max(unsafe { &*generator.cast() })
-        }
-        unsafe fn drop<V: ValueGenerator>(generator: *mut ()) {
-            unsafe { Box::from_raw(generator.cast::<V>()) };
-        }
-        Self {
-            generator: generator_ptr.cast(),
-            vtable: ValueGeneratorVTable {
-                nth: nth::<V>,
-                max: max::<V>,
-                drop: drop::<V>,
-            },
-        }
-    }
-}
-
-impl ValueGenerator for DynValueGenerator {
-    fn nth(&self, i: usize) -> Option<u64> {
-        unsafe { (self.vtable.nth)(self.generator, i) }
-    }
-
-    fn max(&self) -> usize {
-        unsafe { (self.vtable.max)(self.generator) }
-    }
-}
-
-struct Node {
-    generator: DynValueGenerator,
-    type_id: TypeId,
-    children: Vec<Option<Node>>,
+struct TimeLine {
+    past: Vec<u64>,
+    next: u64,
 }
 
 pub struct AlternateRealities {
-    choice_tree: Option<Node>,
-    try_next: BTreeMap<i64, Vec<Vec<usize>>>,
+    try_next: BTreeMap<i64, Vec<TimeLine>>,
 }
 
 impl AlternateRealities {
     pub fn new() -> Self {
-        Self { choice_tree: None, try_next: BTreeMap::new() }
+        Self {
+            try_next: BTreeMap::from([(
+                0,
+                vec![TimeLine {
+                    past: vec![],
+                    next: 0,
+                }],
+            )]),
+        }
     }
-}
 
-impl AlternateRealities {
     pub fn get_next(&mut self) -> Option<Reality<'_>> {
         loop {
             let mut fst = self.try_next.first_entry()?;
@@ -113,70 +29,137 @@ impl AlternateRealities {
                 None => {
                     fst.remove();
                 }
-                Some(v) => {
+                Some(timeline) => {
                     return Some(Reality {
-                        current_node: Some(&mut self.choice_tree),
-                        try_next: &mut self.try_next,
-                        left_already_decided: v.into_iter(),
-                        path_acc: Vec::new(),
+                        timeline: Some(timeline),
+                        current_step: 0,
+                        base: self,
                     });
                 }
             }
         }
     }
+
+    fn add_timeline(&mut self, prio: i64, timeline: TimeLine) {
+        self.try_next.entry(prio).or_default().push(timeline);
+    }
 }
 
 pub struct Reality<'a> {
-    // This option is only transient
-    current_node: Option<&'a mut Option<Node>>,
-    try_next: &'a mut BTreeMap<i64, Vec<Vec<usize>>>,
-    left_already_decided: vec::IntoIter<usize>,
-    path_acc: Vec<usize>,
+    // None to indicate the timelien should not be used anymore
+    timeline: Option<TimeLine>,
+    current_step: usize,
+    base: &'a mut AlternateRealities,
+}
+
+pub trait ExplorationStrategy<Value> {
+    fn prio(&self, raw: u64) -> (Option<i64>, Option<i64>);
+    fn decode(&self, raw: u64) -> Value;
+}
+
+impl<V, S: ExplorationStrategy<V>> ExplorationStrategy<V> for &S {
+    fn prio(&self, raw: u64) -> (Option<i64>, Option<i64>) {
+        (*self).prio(raw)
+    }
+
+    fn decode(&self, raw: u64) -> V {
+        (*self).decode(raw)
+    }
+}
+
+struct ExtremumFirstThenRandom;
+
+impl ExplorationStrategy<i64> for ExtremumFirstThenRandom {
+    fn prio(&self, raw: u64) -> (Option<i64>, Option<i64>) {
+        match raw {
+            0 => (Some())
+        }
+    }
+
+    fn decode(&self, raw: u64) -> i64 {
+        todo!()
+    }
 }
 
 impl<'a> Reality<'a> {
-    pub fn get<T: Encodable + Any, V: ValueGenerator>(
-        &mut self,
-        new_gen: impl FnOnce() -> V,
-        prio: i64,
-    ) -> Option<T> {
-        let raw = self.get_raw(
-            || Node {
-                generator: DynValueGenerator::new(new_gen()),
-                type_id: TypeId::of::<T>(),
-                children: vec![],
-            },
-            prio,
-        )?;
-        Some(T::decode(raw))
+    pub fn get<Value, Strat: ExplorationStrategy<Value>>(&mut self, strat: Strat) -> Option<Value> {
+        let raw = self.get_raw(|raw| strat.prio(raw))?;
+        Some(strat.decode(raw))
     }
 
-    fn get_raw(&mut self, new_gen_node: impl FnOnce() -> Node, prio: i64) -> Option<u64> {
-        let current_node = self.current_node.take().unwrap();
-        let current_node = current_node.get_or_insert_with(new_gen_node);
-        match self.left_already_decided.next() {
-            Some(i) => {
-                let v = current_node.generator.nth(i).unwrap();
-                self.current_node = Some(current_node.children.get_mut(i).unwrap());
-                self.path_acc.push(i);
-                Some(v)
-            }
+    pub fn get_bool(&mut self, prio_true: i64, prio_false: i64) -> Option<bool> {
+        let &TimeLine { ref past, next } = self.timeline.as_ref()?;
+        match past.get(self.current_step) {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            Some(_) => panic!("Wrong boolean encoding"),
             None => {
-                let max = current_node.generator.max();
-                let n = current_node.children.len();
-                if !(n < max) {
-                    return None;
+                debug_assert_eq!(next, 0);
+                let past_true = {
+                    let mut v = Vec::with_capacity(past.len() + 1);
+                    v.extend_from_slice(past);
+                    v.push(1);
+                    v
+                };
+                let past_false = {
+                    let mut v = self.timeline.take().unwrap().past;
+                    v.push(0);
+                    v
+                };
+                self.base.add_timeline(
+                    prio_true,
+                    TimeLine {
+                        past: past_true,
+                        next: 0,
+                    },
+                );
+                self.base.add_timeline(
+                    prio_false,
+                    TimeLine {
+                        past: past_false,
+                        next: 0,
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    fn get_raw(&mut self, prio: impl FnOnce(u64) -> (Option<i64>, Option<i64>)) -> Option<u64> {
+        let &TimeLine { ref past, next } = self.timeline.as_ref()?;
+        match past.get(self.current_step) {
+            Some(&v) => Some(v),
+            None => {
+                let mut already_last = false;
+
+                let mut get_past = |last_call| {
+                    if last_call {
+                        debug_assert!(!already_last);
+                        already_last = true;
+                        self.timeline.take().unwrap().past
+                    } else {
+                        self.timeline.as_ref().unwrap().past.clone()
+                    }
+                };
+
+                let (prio_this, prio_other) = prio(next);
+
+                let next_next = next.checked_add(1);
+
+                if let Some(prio_this) = prio_this {
+                    let mut past = get_past(prio_other.is_none() || next_next.is_none());
+                    past.push(next);
+                    let timeline = TimeLine { past, next: 0 };
+                    self.base.add_timeline(prio_this, timeline);
                 }
-                let n = n + 1;
-                let v = current_node.generator.nth(n)?;
-                self.path_acc.push(n);
-                self.try_next
-                    .entry(prio)
-                    .or_default()
-                    .push(self.path_acc.clone());
-                current_node.children.push(None);
-                self.current_node = Some(current_node.children.last_mut().unwrap());
-                Some(v)
+                if let Some(prio_other) = prio_other {
+                    if let Some(next) = next_next {
+                        let past = get_past(true);
+                        let timeline = TimeLine { past, next };
+                        self.base.add_timeline(prio_other, timeline);
+                    }
+                }
+                None
             }
         }
     }
